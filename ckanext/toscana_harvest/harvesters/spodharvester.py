@@ -265,37 +265,47 @@ class SpodHarvester(HarvesterBase):
         return True
 
     def import_stage(self,harvest_object):
-        log.error('In SpodHarvester import_stage')
+        log.info('=' * 80)
+        log.info('SPOD IMPORT STAGE: Starting for harvest object ID: %s', harvest_object.id)
 
-        context = {'model': model, 'session': Session, 'user': self._get_user_name()}
+        context = {'model': model, 'session': Session, 'user': self._get_user_name(), 'ignore_auth': True}
         if not harvest_object:
-            log.error('No harvest object received')
+            log.error('✗ No harvest object received')
             return False
 
         if harvest_object.content is None:
+            log.error('✗ Empty content for object %s', harvest_object.id)
             self._save_object_error('Empty content for object %s' % harvest_object.id,
                     harvest_object, 'Import')
             return False
 
         self._set_config(harvest_object.job.source.config)
+        log.info('  - Config loaded: remote_groups=%s, remote_orgs=%s', 
+                 self.config.get('remote_groups'), self.config.get('remote_orgs'))
 
         try:
+            log.info('SPOD STEP 1: Loading package_dict from content...')
             package_dict = json.loads(harvest_object.content)
+            log.info('  ✓ Package: %s (type: %s)', package_dict.get('name', 'N/A'), package_dict.get('type', 'dataset'))
 
             if package_dict.get('type') == 'harvest':
-                log.warn('Remote dataset is a harvest source, ignoring...')
+                log.warn('✓ Remote dataset is a harvest source, ignoring...')
                 return True
 
+            log.info('SPOD STEP 2: Processing default tags...')
             # Set default tags if needed
             default_tags = self.config.get('default_tags',[])
             if default_tags:
                 if not 'tags' in package_dict:
                     package_dict['tags'] = []
                 package_dict['tags'].extend([t for t in default_tags if t not in package_dict['tags']])
+                log.info('  ✓ Added default tags: %s', default_tags)
 
+            log.info('SPOD STEP 3: Validating remote groups...')
             remote_groups = self.config.get('remote_groups', None)
             if not remote_groups in ('only_local', 'create'):
                 # Ignore remote groups
+                log.info('  - Ignoring remote groups (mode: %s)', remote_groups)
                 package_dict.pop('groups', None)
             else:
                 if not 'groups' in package_dict:
@@ -303,6 +313,7 @@ class SpodHarvester(HarvesterBase):
 
                 # check if remote groups exist locally, otherwise remove
                 validated_groups = []
+                log.info('  - Validating %d remote groups...', len(package_dict['groups']))
 
                 for group_name in package_dict['groups']:
                     try:
@@ -312,36 +323,42 @@ class SpodHarvester(HarvesterBase):
                             validated_groups.append(group['name'])
                         else:
                             validated_groups.append(group['id'])
+                        log.debug('    ✓ Group %s exists locally', group_name)
                     except NotFound as e:
-                        log.info('Group %s is not available' % group_name)
+                        log.info('    ! Group %s is not available locally', group_name)
                         if remote_groups == 'create':
                             try:
+                                log.info('    - Attempting to create group %s...', group_name)
                                 group = self._get_group(harvest_object.source.url, group_name)
                             except RemoteResourceError:
-                                log.error('Could not get remote group %s' % group_name)
+                                log.error('    ✗ Could not get remote group %s', group_name)
                                 continue
 
                             for key in ['packages', 'created', 'users', 'groups', 'tags', 'extras', 'display_name']:
                                 group.pop(key, None)
 
                             get_action('group_create')(context, group)
-                            log.info('Group %s has been newly created' % group_name)
+                            log.info('    ✓ Group %s has been newly created', group_name)
                             if self.api_version == 1:
                                 validated_groups.append(group['name'])
                             else:
                                 validated_groups.append(group['id'])
 
                 package_dict['groups'] = validated_groups
+                log.info('  ✓ Groups validated: %d/%d', len(validated_groups), len(package_dict.get('groups', [])))
 
 
+            log.info('SPOD STEP 4: Validating remote organizations...')
             # Local harvest source organization
             source_dataset = get_action('package_show')(context, {'id': harvest_object.source.id})
             local_org = source_dataset.get('owner_org')
+            log.info('  - Local harvest source org: %s', local_org)
 
             remote_orgs = self.config.get('remote_orgs', None)
 
             if not remote_orgs in ('only_local', 'create'):
                 # Assign dataset to the source organization
+                log.info('  - Assigning dataset to source organization (mode: %s)', remote_orgs)
                 package_dict['owner_org'] = local_org
             else:
                 if not 'owner_org' in package_dict:
@@ -352,43 +369,53 @@ class SpodHarvester(HarvesterBase):
                 remote_org = package_dict['owner_org']
 
                 if remote_org:
+                    log.info('  - Checking remote organization: %s', remote_org)
                     try:
                         data_dict = {'id': remote_org}
                         org = get_action('organization_show')(context, data_dict)
                         validated_org = org['id']
+                        log.debug('    ✓ Organization %s exists locally', remote_org)
                     except NotFound as e:
-                        log.info('Organization %s is not available' % remote_org)
+                        log.info('    ! Organization %s is not available locally', remote_org)
                         if remote_orgs == 'create':
                             try:
+                                log.info('    - Attempting to create organization %s...', remote_org)
                                 try:
                                     org = self._get_organization(harvest_object.source.url, remote_org)
                                 except RemoteResourceError:
                                     # fallback if remote Spod exposes organizations as groups
                                     # this especially targets older versions of Spod
+                                    log.info('    - Fallback: trying to get as group...')
                                     org = self._get_group(harvest_object.source.url, remote_org)
 
                                 for key in ['packages', 'created', 'users', 'groups', 'tags', 'extras', 'display_name', 'type']:
                                     org.pop(key, None)
                                 get_action('organization_create')(context, org)
-                                log.info('Organization %s has been newly created' % remote_org)
+                                log.info('    ✓ Organization %s has been newly created', remote_org)
                                 validated_org = org['id']
-                            except (RemoteResourceError, ValidationError):
-                                log.error('Could not get remote org %s' % remote_org)
+                            except (RemoteResourceError, ValidationError) as e:
+                                log.error('    ✗ Could not get remote org %s: %s', remote_org, str(e))
+                else:
+                    log.info('  - No remote organization specified')
 
                 package_dict['owner_org'] = validated_org or local_org
+                log.info('  ✓ Final organization: %s', package_dict['owner_org'])
 
+            log.info('SPOD STEP 5: Processing default groups and extras...')
             # Set default groups if needed
             default_groups = self.config.get('default_groups', [])
             if default_groups:
                 if not 'groups' in package_dict:
                     package_dict['groups'] = []
                 package_dict['groups'].extend([g for g in default_groups if g not in package_dict['groups']])
+                log.info('  ✓ Added default groups: %s', default_groups)
 
             # Find any extras whose values are not strings and try to convert
             # them to strings, as non-string extras are not allowed anymore in
             # CKAN 2.0.
+            log.debug('  - Converting non-string extras...')
             for key in package_dict['extras'].keys():
-                if not isinstance(package_dict['extras'][key], basestring):
+                if not isinstance(package_dict['extras'][key], str):
                     try:
                         package_dict['extras'][key] = json.dumps(
                                 package_dict['extras'][key])
@@ -405,7 +432,7 @@ class SpodHarvester(HarvesterBase):
                 for key,value in default_extras.items():
                     if not key in package_dict['extras'] or override_extras:
                         # Look for replacement strings
-                        if isinstance(value,basestring):
+                        if isinstance(value,str):
                             value = value.format(harvest_source_id=harvest_object.job.source.id,
                                      harvest_source_url=harvest_object.job.source.url.strip('/'),
                                      harvest_source_title=harvest_object.job.source.title,
@@ -414,7 +441,9 @@ class SpodHarvester(HarvesterBase):
                                      dataset_id=package_dict['id'])
 
                         package_dict['extras'][key] = value
+            log.info('  ✓ Extras processed')
 
+            log.info('SPOD STEP 6: Cleaning resources metadata...')
             for resource in package_dict.get('resources', []):
                 # Clear remote url_type for resources (eg datastore, upload) as
                 # we are only creating normal resources with links to the
@@ -425,14 +454,33 @@ class SpodHarvester(HarvesterBase):
                 # and saving it will cause an IntegrityError with the foreign
                 # key.
                 resource.pop('revision_id', None)
+            log.info('  ✓ %d resources cleaned', len(package_dict.get('resources', [])))
 
+            log.info('SPOD STEP 7: Creating or updating package...')
             result = self._create_or_update_package(package_dict,harvest_object)
+            
+            if result:
+                log.info('✓✓✓ SPOD IMPORT COMPLETED for object %s', harvest_object.id)
+            else:
+                log.error('✗✗✗ SPOD IMPORT FAILED for object %s', harvest_object.id)
+            
             return result
+            
         except ValidationError as e:
+            log.error('✗✗✗ SPOD VALIDATION ERROR for object %s', harvest_object.id)
+            log.error('  Error dict: %s', e.error_dict)
+            import traceback
+            log.error('  Traceback:\n%s', traceback.format_exc())
             self._save_object_error('Invalid package with GUID %s: %r' % (harvest_object.guid, e.error_dict),
                     harvest_object, 'Import')
+            return False
+            
         except Exception as e:
+            log.error('✗✗✗ SPOD IMPORT EXCEPTION for object %s: %s', harvest_object.id, str(e))
+            import traceback
+            log.error('  Traceback:\n%s', traceback.format_exc())
             self._save_object_error('%r'%e,harvest_object,'Import')
+            return False
 
 class ContentFetchError(Exception):
     pass

@@ -155,7 +155,7 @@ class MetarepoHarvester(HarvesterBase):
                                      ' names/ids')
                 if config_obj['default_groups'] and \
                         not isinstance(config_obj['default_groups'][0],
-                                       basestring):
+                                       str):
                     raise ValueError('default_groups must be a list of group '
                                      'names/ids (i.e. strings)')
 
@@ -430,31 +430,38 @@ class MetarepoHarvester(HarvesterBase):
         return True
 
     def import_stage(self, harvest_object):
-        log.error('In MetarepoHarvester import_stage')
+        log.info('=' * 80)
+        log.info('METAREPO IMPORT STAGE: Starting for harvest object ID: %s', harvest_object.id)
 
         base_context = {'model': model, 'session': model.Session,
-                        'user': self._get_user_name()}
+                        'user': self._get_user_name(),
+                        'ignore_auth': True}
         if not harvest_object:
-            log.error('No harvest object received')
+            log.error('✗ No harvest object received')
             return False
 
         if harvest_object.content is None:
-            log.error('harvest_object.content is None')
+            log.error('✗ Empty content for object %s', harvest_object.id)
             self._save_object_error('Empty content for object %s' %
                                     harvest_object.id,
                                     harvest_object, 'Import')
             return False
 
         self._set_config(harvest_object.job.source.config)
+        log.info('  - Config loaded: remote_groups=%s, remote_orgs=%s', 
+                 self.config.get('remote_groups'), self.config.get('remote_orgs'))
 
         try:
+            log.info('METAREPO STEP 1: Loading package_dict from content...')
             response_dict = json.loads(harvest_object.content)
             package_dict = response_dict.get('result', {})
+            log.info('  ✓ Package: %s (type: %s)', package_dict.get('name', 'N/A'), package_dict.get('type', 'dataset'))
 
             if package_dict.get('type') == 'harvest':
-                log.warn('Remote dataset is a harvest source, ignoring...')
+                log.warn('✓ Remote dataset is a harvest source, ignoring...')
                 return True
 
+            log.info('METAREPO STEP 2: Processing default tags...')
             # Set default tags if needed
             default_tags = self.config.get('default_tags', [])
             if default_tags:
@@ -467,12 +474,17 @@ class MetarepoHarvester(HarvesterBase):
 
                 package_dict['tags'].extend(
                     [t for t in default_tags if t not in package_dict['tags']])
+                log.info('  - Added default tags: %s', default_tags)
 
             package_dict['tags'] = [clean_tag(t) for t in package_dict['tags']]
+            log.info('  ✓ Tags cleaned: %d total', len(package_dict['tags']))
+            
+            log.info('METAREPO STEP 3: Validating remote groups...')
             remote_groups = self.config.get('remote_groups', None)
 
             if not remote_groups in ('only_local', 'create'):
                 # Ignore remote groups
+                log.info('  - Ignoring remote groups (mode: %s)', remote_groups)
                 package_dict.pop('groups', None)
             else:
                 if not 'groups' in package_dict:
@@ -480,39 +492,46 @@ class MetarepoHarvester(HarvesterBase):
 
                 # check if remote groups exist locally, otherwise remove
                 validated_groups = []
+                log.info('  - Validating %d remote groups...', len(package_dict['groups']))
 
                 for group_ in package_dict['groups']:
                     try:
                         data_dict = {'id': group_['id']}
                         group = get_action('group_show')(base_context.copy(), data_dict)
                         validated_groups.append({'id': group['id'], 'name': group['name']})
+                        log.debug('    ✓ Group %s exists locally', group_)
 
                     except NotFound as e:
-                        log.info('Group %s is not available', group_)
+                        log.info('    ! Group %s is not available locally', group_)
                         if remote_groups == 'create':
                             try:
+                                log.info('    - Attempting to create group %s...', group_)
                                 group = self._get_group(harvest_object.source.url, group_)
                             except RemoteResourceError:
-                                log.error('Could not get remote group %s', group_)
+                                log.error('    ✗ Could not get remote group %s', group_)
                                 continue
 
                             for key in ['packages', 'created', 'users', 'groups', 'tags', 'extras', 'display_name']:
                                 group.pop(key, None)
 
                             get_action('group_create')(base_context.copy(), group)
-                            log.info('Group %s has been newly created', group_)
+                            log.info('    ✓ Group %s has been newly created', group_)
                             validated_groups.append({'id': group['id'], 'name': group['name']})
 
                 package_dict['groups'] = validated_groups
+                log.info('  ✓ Groups validated: %d/%d', len(validated_groups), len(package_dict.get('groups', [])))
 
+            log.info('METAREPO STEP 4: Validating remote organizations...')
             # Local harvest source organization
             source_dataset = get_action('package_show')(base_context.copy(), {'id': harvest_object.source.id})
             local_org = source_dataset.get('owner_org')
+            log.info('  - Local harvest source org: %s', local_org)
 
             remote_orgs = self.config.get('remote_orgs', None)
 
             if not remote_orgs in ('only_local', 'create'):
                 # Assign dataset to the source organization
+                log.info('  - Assigning dataset to source organization (mode: %s)', remote_orgs)
                 package_dict['owner_org'] = local_org
             else:
                 if not 'owner_org' in package_dict:
@@ -523,31 +542,39 @@ class MetarepoHarvester(HarvesterBase):
                 remote_org = package_dict['owner_org']
 
                 if remote_org:
+                    log.info('  - Checking remote organization: %s', remote_org)
                     try:
                         data_dict = {'id': remote_org}
                         org = get_action('organization_show')(base_context.copy(), data_dict)
                         validated_org = org['id']
+                        log.debug('    ✓ Organization %s exists locally', remote_org)
                     except NotFound as e:
-                        log.info('Organization %s is not available', remote_org)
+                        log.info('    ! Organization %s is not available locally', remote_org)
                         if remote_orgs == 'create':
                             try:
+                                log.info('    - Attempting to create organization %s...', remote_org)
                                 try:
                                     org = self._get_organization(harvest_object.source.url, remote_org)
                                 except RemoteResourceError:
                                     # fallback if remote Metarepo exposes organizations as groups
                                     # this especially targets older versions of Metarepo
+                                    log.info('    - Fallback: trying to get as group...')
                                     org = self._get_group(harvest_object.source.url, remote_org)
 
                                 for key in ['packages', 'created', 'users', 'groups', 'tags', 'extras', 'display_name', 'type']:
                                     org.pop(key, None)
                                 get_action('organization_create')(base_context.copy(), org)
-                                log.info('Organization %s has been newly created', remote_org)
+                                log.info('    ✓ Organization %s has been newly created', remote_org)
                                 validated_org = org['id']
-                            except (RemoteResourceError, ValidationError):
-                                log.error('Could not get remote org %s', remote_org)
+                            except (RemoteResourceError, ValidationError) as e:
+                                log.error('    ✗ Could not get remote org %s: %s', remote_org, str(e))
+                else:
+                    log.info('  - No remote organization specified')
 
                 package_dict['owner_org'] = validated_org or local_org
+                log.info('  ✓ Final organization: %s', package_dict['owner_org'])
 
+            log.info('METAREPO STEP 5: Processing default groups and extras...')
             # Set default groups if needed
             default_groups = self.config.get('default_groups', [])
             if default_groups:
@@ -557,8 +584,10 @@ class MetarepoHarvester(HarvesterBase):
                 package_dict['groups'].extend(
                     [g for g in self.config['default_group_dicts']
                     if g['id'] not in existing_group_ids])
+                log.info('  ✓ Added default groups: %s', default_groups)
 
             # Set default extras if needed
+            log.debug('  - Processing default extras...')
             default_extras = self.config.get('default_extras', {})
             def get_extra(key, package_dict):
                 for extra in package_dict.get('extras', []):
@@ -575,7 +604,7 @@ class MetarepoHarvester(HarvesterBase):
                     if existing_extra:
                         package_dict['extras'].remove(existing_extra)
                     # Look for replacement strings
-                    if isinstance(value, basestring):
+                    if isinstance(value, str):
                         value = value.format(
                             harvest_source_id=harvest_object.job.source.id,
                             harvest_source_url=
@@ -587,7 +616,9 @@ class MetarepoHarvester(HarvesterBase):
                             dataset_id=package_dict['id'])
 
                     package_dict['extras'].append({'key': key, 'value': value})
+            log.info('  ✓ Extras processed')
 
+            log.info('METAREPO STEP 6: Cleaning resources metadata...')
             for resource in package_dict.get('resources', []):
                 # Clear remote url_type for resources (eg datastore, upload) as
                 # we are only creating normal resources with links to the
@@ -598,17 +629,35 @@ class MetarepoHarvester(HarvesterBase):
                 # and saving it will cause an IntegrityError with the foreign
                 # key.
                 resource.pop('revision_id', None)
+            log.info('  ✓ %d resources cleaned', len(package_dict.get('resources', [])))
 
+            log.info('METAREPO STEP 7: Creating or updating package...')
             result = self._create_or_update_package(
                 package_dict, harvest_object, package_dict_form='package_show')
 
+            if result:
+                log.info('✓✓✓ METAREPO IMPORT COMPLETED for object %s', harvest_object.id)
+            else:
+                log.error('✗✗✗ METAREPO IMPORT FAILED for object %s', harvest_object.id)
+
             return result
+            
         except ValidationError as e:
+            log.error('✗✗✗ METAREPO VALIDATION ERROR for object %s', harvest_object.id)
+            log.error('  Error dict: %s', e.error_dict)
+            import traceback
+            log.error('  Traceback:\n%s', traceback.format_exc())
             self._save_object_error('Invalid package with GUID %s: %r' %
                                     (harvest_object.guid, e.error_dict),
                                     harvest_object, 'Import')
+            return False
+            
         except Exception as e:
+            log.error('✗✗✗ METAREPO IMPORT EXCEPTION for object %s: %s', harvest_object.id, str(e))
+            import traceback
+            log.error('  Traceback:\n%s', traceback.format_exc())
             self._save_object_error('%s' % e, harvest_object, 'Import')
+            return False
 
 
 class ContentFetchError(Exception):
