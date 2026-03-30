@@ -223,11 +223,34 @@ class SpodHarvester(HarvesterBase):
         try:
             object_ids = []
             if len(package_ids):
+                remote_ids = set(package_ids)
+
                 for package_id in package_ids:
                     # Create a new HarvestObject for this identifier
                     obj = HarvestObject(guid = package_id, job = harvest_job)
                     obj.save()
                     object_ids.append(obj.id)
+
+                # Find local packages no longer present in the remote source
+                source_dataset = get_action('package_show')(
+                    {'model': model, 'session': Session, 'ignore_auth': True},
+                    {'id': harvest_job.source.id}
+                )
+                local_org = source_dataset.get('owner_org')
+                if local_org:
+                    local_packages = Session.query(model.Package).filter(
+                        model.Package.owner_org == local_org,
+                        model.Package.state == 'active',
+                        model.Package.type != 'harvest'
+                    ).all()
+                    for pkg in local_packages:
+                        if pkg.id not in remote_ids:
+                            log.info('Package %s (%s) no longer in remote source, marking for deletion', pkg.id, pkg.name)
+                            obj = HarvestObject(guid=pkg.id, job=harvest_job,
+                                                report_status='deleted',
+                                                package_id=pkg.id)
+                            obj.save()
+                            object_ids.append(obj.id)
 
                 return object_ids
 
@@ -272,6 +295,12 @@ class SpodHarvester(HarvesterBase):
         if not harvest_object:
             log.error('✗ No harvest object received')
             return False
+
+        if harvest_object.report_status == 'deleted':
+            log.info('Deleting package %s', harvest_object.package_id)
+            get_action('package_delete')(context, {'id': harvest_object.package_id})
+            log.info('✓ Package %s deleted', harvest_object.package_id)
+            return True
 
         if harvest_object.content is None:
             log.error('✗ Empty content for object %s', harvest_object.id)
@@ -441,6 +470,9 @@ class SpodHarvester(HarvesterBase):
                                      dataset_id=package_dict['id'])
 
                         package_dict['extras'][key] = value
+            # Always set harvest_source_id so the package counter in the
+            # harvester admin panel works correctly
+            package_dict['extras']['harvest_source_id'] = harvest_object.job.source.id
             log.info('  ✓ Extras processed')
 
             log.info('SPOD STEP 6: Cleaning resources metadata...')
