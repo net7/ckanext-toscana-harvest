@@ -226,7 +226,17 @@ class SpodHarvester(HarvesterBase):
                     obj.save()
                     object_ids.append(obj.id)
 
-                # Find local packages no longer present in the remote source
+                # Find local packages no longer present in the remote source.
+                # Use harvest_object.guid as the remote identifier — pkg.id may
+                # differ from the remote UUID for manually-imported datasets.
+                harvested_pkg_ids = set(
+                    row.package_id for row in
+                    Session.query(HarvestObject.package_id)
+                    .filter(HarvestObject.harvest_source_id == harvest_job.source.id)
+                    .filter(HarvestObject.guid.in_(remote_ids))
+                    .filter(HarvestObject.package_id != None)
+                    .distinct()
+                )
                 source_dataset = get_action('package_show')(
                     {'model': model, 'session': Session, 'ignore_auth': True},
                     {'id': harvest_job.source.id}
@@ -239,7 +249,7 @@ class SpodHarvester(HarvesterBase):
                         model.Package.type != 'harvest'
                     ).all()
                     for pkg in local_packages:
-                        if pkg.id not in remote_ids:
+                        if pkg.id not in harvested_pkg_ids and pkg.id not in remote_ids:
                             log.info('Package %s (%s) no longer in remote source, marking for deletion', pkg.id, pkg.name)
                             obj = HarvestObject(guid=pkg.id, job=harvest_job,
                                                 report_status='deleted',
@@ -485,12 +495,20 @@ class SpodHarvester(HarvesterBase):
 
             log.info('SPOD STEP 7: Creating or updating package...')
             result = self._create_or_update_package(package_dict,harvest_object)
-            
+
             if result:
+                # Force Solr reindex so harvest_source_id is always indexed
+                try:
+                    import ckan.lib.search as search
+                    pkg_id = harvest_object.package_id or package_dict.get('id')
+                    if pkg_id:
+                        search.rebuild(package_id=pkg_id)
+                except Exception as e:
+                    log.warning('Could not reindex package %s: %s', harvest_object.id, e)
                 log.info('✓✓✓ SPOD IMPORT COMPLETED for object %s', harvest_object.id)
             else:
                 log.error('✗✗✗ SPOD IMPORT FAILED for object %s', harvest_object.id)
-            
+
             return result
             
         except ValidationError as e:
