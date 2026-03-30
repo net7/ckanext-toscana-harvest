@@ -36,7 +36,7 @@ class SpodHarvester(HarvesterBase):
         return '/api/%d/search' % self.api_version
 
     def _get_content(self, url):
-        log.error("get_content " + url)
+        log.debug("get_content " + url)
         http_request = urllib.request.Request(url=url)
 
         api_key = self.config.get('api_key')
@@ -46,22 +46,17 @@ class SpodHarvester(HarvesterBase):
         try:
             http_response = urllib.request.urlopen(http_request)
         except urllib.error.HTTPError as e:
-            log.error("httperror")
-            log.error(e.getcode())
-            log.error(e.reason)
             if e.getcode() == 404:
+                log.warning('HTTP 404 Not Found: %s', url)
                 raise ContentNotFoundError('HTTP error: %s' % e.code)
             else:
+                log.error('HTTP error %s on %s: %s', e.getcode(), url, e.reason)
                 raise ContentFetchError('HTTP error: %s' % e.code)
-        except urllib.error.URLError as  e:
-            log.error("urlerror")
-            log.error(e.getcode())
-            log.error(e.reason)
+        except urllib.error.URLError as e:
+            log.error('URL error on %s: %s', url, e.reason)
             raise ContentFetchError('URL error: %s' % e.reason)
         except http.client.HTTPException as e:
-            log.error("httpexcption")
-            log.error(e.getcode())
-            log.error(e.reason)
+            log.error('HTTP exception on %s: %s', url, e)
             raise ContentFetchError('HTTP Exception: %s' % e)
         return http_response.read()
 
@@ -155,7 +150,7 @@ class SpodHarvester(HarvesterBase):
 
 
     def gather_stage(self,harvest_job):
-        log.error('In SpodHarvester gather_stage (%s)' % harvest_job.source.url)
+        log.debug('In SpodHarvester gather_stage (%s)' % harvest_job.source.url)
         get_all_packages = True
         package_ids = []
 
@@ -200,9 +195,9 @@ class SpodHarvester(HarvesterBase):
 
         if get_all_packages:
             # Request all remote packages
-            log.error("Request all remote packages")
+            log.debug("Request all remote packages")
             url = base_rest_url + '/package'
-            log.error(url)
+            log.debug(url)
             try:
                 content = self._get_content(url)
                 package_ids = json.loads(content)
@@ -265,7 +260,7 @@ class SpodHarvester(HarvesterBase):
 
 
     def fetch_stage(self,harvest_object):
-        log.error('In SpodHarvester fetch_stage')
+        log.debug('In SpodHarvester fetch_stage')
 
         self._set_config(harvest_object.job.source.config)
 
